@@ -1,0 +1,28 @@
+---
+
+use_all_sd_disk: |
+  {% set swraid_disks = [] %}
+  {% set exclude_disks_full_path =  extra_disks | default([]) | map(attribute='disk') %}
+  {% set exclude_disks =  extra_disks | default([]) | map(attribute='disk') | regex_replace('/dev/')  %}
+  {% for device in ansible_devices  | difference(exclude_disks) if ( device.startswith('sd') or device.startswith("/dev/"))-%}
+      {% set _ = swraid_disks.append('/dev/' + device )%}
+  {% endfor %}
+  {{ swraid_disks | difference(exclude_disks_full_path) }}
+
+use_all_nvme_disk: |
+  {% set swraid_disks = [] %}
+  {% set exclude_disks_full_path =  extra_disks | default([]) | map(attribute='disk') %}
+  {% set exclude_disks =  extra_disks | default([]) | map(attribute='disk') | regex_replace('/dev/')  %}
+  {% for device in ansible_devices  | difference(exclude_disks) if ( device.startswith('nvme') or device.startswith("/dev/"))-%}
+      {% set _ = swraid_disks.append('/dev/' + device )%}
+  {% endfor %}
+  {{ swraid_disks | difference(exclude_disks_full_path) }}
+
+raids: []
+  # - name: 'md2'
+  #   devices: "{{ use_all_sd_disk | default([]) }}"
+  #   filesystem: 'ext4'
+  #   level: '6'
+  #   mountpoint: '/data'
+  #   state: 'present'
+#   opts: 'noatime'

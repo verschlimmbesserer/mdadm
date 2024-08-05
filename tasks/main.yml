@@ -1,0 +1,181 @@
+---
+
+- name: "Installing mdadm"
+  ansible.builtin.apt:
+    name: "mdadm"
+    state: "present"
+
+- name: "Setting distribution-specific facts"
+  ansible.builtin.set_fact:
+    update_initramfs: "update-initramfs -u"
+    mdadm_conf: "/etc/mdadm/mdadm.conf"
+    mdadm_conf_path: "/etc/mdadm"
+
+- name: "Wipe Disks to prepare for RAID"
+  when: mdadm_force_wipe is defined and mdadm_force_wipe
+  block:
+
+    - name: "Wipe Disks"
+      ansible.builtin.command: "wipefs -af {{ item.1 }}"
+      register: disks_wiped
+      changed_when: disks_wiped.rc != 0
+      with_subelements:
+        - '{{ raids }}'
+        - devices
+
+    - name: "Updating Initramfs after wiping disks"
+      ansible.builtin.command: "{{ update_initramfs }}"
+      register: update_initramfs
+      changed_when: update_initramfs.rc != 0
+      when: disks_wiped.changed
+
+- name: "Checking Status of existing RAID Array(s)"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      cat /proc/mdstat | grep {{ item.name }}
+    executable: /bin/bash
+  register: "array_check"
+  changed_when: false
+  failed_when: false
+  with_items: '{{ raids }}'
+  check_mode: true
+
+- name: "Creating RAID Array(s)"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      yes | mdadm --create /dev/{{ item.name }} --level={{ item.level }} --raid-devices={{ item.devices|count }} {{ item.devices | join (' ') }}
+    executable: /bin/bash
+  register: array_created
+  changed_when: array_created.rc != 0
+  with_items: '{{ raids }}'
+  when: >
+    item.state|lower == "present" and
+    array_check.results[0].rc != 0
+
+- name: "Updating Initramfs archives in /boot"
+  ansible.builtin.command: "{{ update_initramfs }}"
+  register: update_initramfs
+  changed_when: update_initramfs.rc != 0
+  when: array_created.changed
+
+- name: "Capturing RAID Array Details to append to mdadm.conf"
+  ansible.builtin.command: "mdadm --detail --scan"
+  register: "array_details"
+  changed_when: false
+
+- name: "Creating RAID Array(s) Filesystem"
+  ansible.builtin.filesystem:
+    fstype: "{{ item.filesystem }}"
+    opts: "{{ item.filesystem_opts | default(omit) }}"
+    dev: "/dev/{{ item.name }}"
+  register: creating_raid
+  changed_when: creating_raid.rc != 0
+  with_items: '{{ raids }}'
+  when:
+    - item.state|lower == "present"
+    - item.filesystem is defined
+
+- name: "Mounting RAID Array(s)"
+  ansible.posix.mount:
+    name: "{{ item.mountpoint }}"
+    src: "/dev/{{ item.name }}"
+    fstype: "{{ item.filesystem }}"
+    state: "mounted"
+    opts: "{{ item.opts | default(omit) }}"
+  with_items: '{{ raids }}'
+  when:
+    - item.state|lower == "present"
+    - item.filesystem is defined
+    - item.mountpoint is defined
+
+- name: "Unmounting RAID Array(s)"
+  ansible.posix.mount:
+    name: "{{ item.mountpoint }}"
+    src: "/dev/{{ item.name }}"
+    state: "unmounted"
+  with_items: '{{ raids }}'
+  when:
+    - item.state|lower == "absent"
+    - item.mountpoint is defined
+
+- name: "Stopping RAID Array(s)"
+  ansible.builtin.command: "mdadm --stop /dev/{{ item.name }}"
+  register: "array_stopped"
+  changed_when: array_stopped.rc != 0
+  with_items: '{{ raids }}'
+  when: >
+    item.state|lower == "absent" and
+    array_check.results[0].rc == 0
+
+- name: "Removing RAID Array(s)"
+  ansible.builtin.command: "mdadm --remove /dev/{{ item.name }}"
+  register: "array_removed"
+  changed_when: array_removed.rc != 0
+  with_items: '{{ raids }}'
+  when: >
+    item.state|lower == "absent" and
+    array_check.results[0].rc == 0
+
+- name: "Zeroing Out Array Devices"
+  ansible.builtin.command: "mdadm --zero-superblock {{ item.1 }}"
+  register: zeroing_arrays
+  changed_when: zeroing_arrays.rc != 0
+  with_subelements:
+    - '{{ raids }}'
+    - devices
+  when: >
+    item.0.state|lower == "absent" and
+    array_check.results[0].rc == 0 and
+    array_removed.changed
+
+- name: "Wiping Out RAID Array Devices"
+  ansible.builtin.command: "wipefs -af {{ item.1 }}"
+  register: wiping_raid
+  changed_when: wiping_raid.rc != 0
+  with_subelements:
+    - '{{ raids }}'
+    - devices
+  when: >
+    item.0.state|lower == "absent" and
+    array_check.results[0].rc == 0 and
+    array_removed.changed
+
+- name: "Ensure directory exists for {{ mdadm_conf }}"
+  ansible.builtin.file:
+    path: "{{ mdadm_conf_path }}"
+    state: directory
+  when: mdadm_conf_path is defined
+
+- name: "Ensure file exists for {{ mdadm_conf }}"
+  ansible.builtin.copy:
+    content: ""
+    dest: "{{ mdadm_conf }}"
+    force: false
+
+# Updating mdadm.conf in order to persist between reboots
+- name: "Updating {{ mdadm_conf }}"
+  ansible.builtin.lineinfile:
+    dest: "{{ mdadm_conf }}"
+    regexp: "^{{ item }}"
+    line: "{{ item }}"
+    state: "present"
+  with_items: '{{ array_details.stdout_lines }}'
+  when: array_created.changed
+
+- name: "Updating {{ mdadm_conf }}"
+  ansible.builtin.lineinfile:
+    dest: "{{ mdadm_conf }}"
+    regexp: "^ARRAY /dev/{{ item.name }}"
+    line: "ARRAY /dev/{{ item.name }}"
+    state: "absent"
+  with_items: '{{ raids }}'
+  when: >
+    item.state == "absent"
+
+- name: "Updating Initramfs after removing RAID Array(s)"
+  ansible.builtin.command: "{{ update_initramfs }}"
+  register: update_initramfs
+  changed_when: update_initramfs.rc != 0
+  when: array_removed.changed and ansible_facts.os_family == "Debian"
